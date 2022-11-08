@@ -49,7 +49,6 @@
 // it calls the OnFinish callback.
 //
 // For a full ping example, see "cmd/ping/ping.go".
-//
 package ping
 
 import (
@@ -60,10 +59,13 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 	"golang.org/x/net/icmp"
@@ -80,9 +82,46 @@ const (
 )
 
 var (
-	ipv4Proto = map[string]string{"icmp": "ip4:icmp", "udp": "udp4"}
-	ipv6Proto = map[string]string{"icmp": "ip6:ipv6-icmp", "udp": "udp6"}
+	ipv4Proto                  = map[string]string{"icmp": "ip4:icmp", "udp": "udp4"}
+	ipv6Proto                  = map[string]string{"icmp": "ip6:ipv6-icmp", "udp": "udp6"}
+	basetime                   = time.Now()
+	modkernel32                = syscall.NewLazyDLL("kernel32.dll")
+	_QueryPerformanceFrequency = modkernel32.NewProc("QueryPerformanceFrequency")
+	_QueryPerformanceCounter   = modkernel32.NewProc("QueryPerformanceCounter")
+	cpufreq                    = QPCFrequency()
+	isWindows                  = AreWeOnWindows()
 )
+
+// Returns an int64 of the number of ticks since start using queryPerformanceCounter
+func QPC() int64 {
+	var now int64
+	r1, _, _ := syscall.Syscall(_QueryPerformanceCounter.Addr(), 1, uintptr(unsafe.Pointer(&now)), 0, 0)
+	if r1 == 0 {
+		panic("call failed")
+	}
+	return now
+}
+
+// QPCFrequency returns frequency in ticks per second
+func QPCFrequency() int64 {
+	var freq int64
+	r1, _, _ := syscall.Syscall(_QueryPerformanceFrequency.Addr(), 1, uintptr(unsafe.Pointer(&freq)), 0, 0)
+	if r1 == 0 {
+		panic("call failed")
+	}
+	return freq
+}
+
+// Check if we are running on a Windows OS
+func AreWeOnWindows() bool {
+	return runtime.GOOS == "windows"
+}
+
+// Get duration of a CPU cycle (tick)
+func GetTickDuration() time.Duration {
+	out, _ := time.ParseDuration(strconv.FormatInt(time.Second.Nanoseconds()/QPCFrequency(), 10) + "ns")
+	return out
+}
 
 // New returns a new Pinger struct pointer.
 func New(addr string) *Pinger {
@@ -572,7 +611,7 @@ func (p *Pinger) recvICMP(
 	recv chan<- *packet,
 ) error {
 	// Start by waiting for 50 µs and increase to a possible maximum of ~ 100 ms.
-	expBackoff := newExpBackoff(50*time.Microsecond, 11)
+	expBackoff := newExpBackoff(50*time.Microsecond, 8)
 	delay := expBackoff.Get()
 
 	for {
@@ -602,6 +641,8 @@ func (p *Pinger) recvICMP(
 			case <-p.done:
 				return nil
 			case recv <- &packet{bytes: bytes, nbytes: n, ttl: ttl}:
+				fmt.Println("Bytes:")
+				fmt.Println(fmt.Sprintf("%#v", bytes))
 			}
 		}
 	}
@@ -629,7 +670,15 @@ func (p *Pinger) getCurrentTrackerUUID() uuid.UUID {
 }
 
 func (p *Pinger) processPacket(recv *packet) error {
-	receivedAt := time.Now()
+	td := time.Since(basetime).Nanoseconds()
+	tq := QPC() * time.Second.Nanoseconds() / cpufreq
+	var receivedAt int64
+	if isWindows {
+		receivedAt = tq
+	} else {
+		receivedAt = td
+	}
+
 	var proto int
 	if p.ipv4 {
 		proto = protocolICMP
@@ -655,7 +704,7 @@ func (p *Pinger) processPacket(recv *packet) error {
 		Ttl:    recv.ttl,
 		ID:     p.id,
 	}
-
+	fmt.Printf("TTL : %v\n", recv.ttl)
 	switch pkt := m.Body.(type) {
 	case *icmp.Echo:
 		if !p.matchID(pkt.ID) {
@@ -672,8 +721,15 @@ func (p *Pinger) processPacket(recv *packet) error {
 			return err
 		}
 
-		timestamp := bytesToTime(pkt.Data[:timeSliceLength])
-		inPkt.Rtt = receivedAt.Sub(timestamp)
+		var timestamp int64
+		if isWindows {
+			timestamp = bytesToQpc(pkt.Data[:timeSliceLength])
+		} else {
+			timestamp = bytesToDuration(pkt.Data[:timeSliceLength]).Nanoseconds()
+		}
+
+		//inPkt.Rtt = receivedAt.Sub(timestamp)
+		inPkt.Rtt, _ = time.ParseDuration(strconv.FormatInt(receivedAt-timestamp, 10) + "ns")
 		inPkt.Seq = pkt.Seq
 		// If we've already received this sequence, ignore it.
 		if _, inflight := p.awaitingSequences[*pktUUID][pkt.Seq]; !inflight {
@@ -710,11 +766,18 @@ func (p *Pinger) sendICMP(conn packetConn) error {
 	if err != nil {
 		return fmt.Errorf("unable to marshal UUID binary: %w", err)
 	}
-	t := append(timeToBytes(time.Now()), uuidEncoded...)
+	var t []byte
+	if isWindows {
+		t = append(QpcToBytes(QPC()*time.Second.Nanoseconds()/cpufreq), uuidEncoded...)
+	} else {
+		t = append(durationToBytes(time.Since(basetime)), uuidEncoded...)
+	}
 	if remainSize := p.Size - timeSliceLength - trackerLength; remainSize > 0 {
 		t = append(t, bytes.Repeat([]byte{1}, remainSize)...)
 	}
 
+	fmt.Println("Bytes t :")
+	fmt.Println(fmt.Sprintf("%#v", t))
 	body := &icmp.Echo{
 		ID:   p.id,
 		Seq:  p.sequence,
@@ -791,6 +854,7 @@ func (p *Pinger) listen() (packetConn, error) {
 	return conn, nil
 }
 
+/*
 func bytesToTime(b []byte) time.Time {
 	var nsec int64
 	for i := uint8(0); i < 8; i++ {
@@ -798,16 +862,55 @@ func bytesToTime(b []byte) time.Time {
 	}
 	return time.Unix(nsec/1000000000, nsec%1000000000)
 }
+*/
+
+func bytesToDuration(b []byte) time.Duration {
+	var nsec int64
+	var t time.Duration
+	for i := uint8(0); i < 8; i++ {
+		nsec += int64(b[i]) << ((7 - i) * 8)
+	}
+	nstring := strconv.FormatInt(nsec, 10) + "ns"
+	t, _ = time.ParseDuration(nstring)
+	return t
+}
+
+func bytesToQpc(b []byte) int64 {
+	var nticks int64
+	for i := uint8(0); i < 8; i++ {
+		nticks += int64(b[i]) << ((7 - i) * 8)
+	}
+	return nticks
+}
 
 func isIPv4(ip net.IP) bool {
 	return len(ip.To4()) == net.IPv4len
 }
 
+/*
 func timeToBytes(t time.Time) []byte {
 	nsec := t.UnixNano()
 	b := make([]byte, 8)
 	for i := uint8(0); i < 8; i++ {
 		b[i] = byte((nsec >> ((7 - i) * 8)) & 0xff)
+	}
+	return b
+}
+*/
+
+func durationToBytes(d time.Duration) []byte {
+	nsec := d.Nanoseconds()
+	b := make([]byte, 8)
+	for i := uint8(0); i < 8; i++ {
+		b[i] = byte((nsec >> ((7 - i) * 8)) & 0xff)
+	}
+	return b
+}
+
+func QpcToBytes(nticks int64) []byte {
+	b := make([]byte, 8)
+	for i := uint8(0); i < 8; i++ {
+		b[i] = byte((nticks >> ((7 - i) * 8)) & 0xff)
 	}
 	return b
 }
