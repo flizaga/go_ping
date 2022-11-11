@@ -59,6 +59,7 @@ type icmpv4Conn struct {
 func (c *icmpv4Conn) SetFlagTTL() error {
 	err := c.c.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
 	if runtime.GOOS == "windows" {
+		// SetControlMessage on windows is not yet supported by Golang
 		return nil
 	}
 	return err
@@ -84,6 +85,7 @@ type icmpV6Conn struct {
 func (c *icmpV6Conn) SetFlagTTL() error {
 	err := c.c.IPv6PacketConn().SetControlMessage(ipv6.FlagHopLimit, true)
 	if runtime.GOOS == "windows" {
+		// SetControlMessage on windows is not yet supported by Golang
 		return nil
 	}
 	return err
