@@ -122,8 +122,8 @@ x/net/ipv4 and x/net/ipv6 packages.
 
 ### Plan 9 from Bell Labs
 
-There is no support for Plan 9. This is because the entire `x/net/ipv4` 
-and `x/net/ipv6` packages are not implemented by the Go programming 
+There is no support for Plan 9. This is because the entire `x/net/ipv4`
+and `x/net/ipv6` packages are not implemented by the Go programming
 language.
 
 ## Maintainers and Getting Help:
@@ -139,3 +139,30 @@ to the Gophers Slack org.
 ## Contributing
 
 Refer to [CONTRIBUTING.md](https://github.com/go-ping/ping/blob/master/CONTRIBUTING.md)
+
+## Flizaga changes
+
+- Changed the way we get the ping latency
+	The current go_ping project stores a date in the ping packet data, then compare this date to the current reception date
+	On Linux/Unix, this is working, but it's not optimal, because if the clock changed in the meantime,
+		for time adjustment via ntp or daylight time change, it can give an inaccurate latency.
+		So I changed on unix/linux/macos to store a time object on the programm side instead of the packet.
+		On GOlang level, the time obj stores two time values : a date/timestamp and a monotonic clock value
+		When you use a substraction in order to get a duration, then Golang will use the monotonic clock values,
+		so it's not affected by any modification on system date and time.
+	On Windows, the system clock has a very bad precision (approx 18ms precision) and monotonic clock is also no very accurate (1ms).
+		So the best way is to use performance counters, it has higher resolution. Accuracy is 1 CPU Cycle which would be 3ns for a 3Ghz CPU
+		As far as I know it's a bit more resources consuming, and we get a little overhead to do the kernel32 syscall, but it's a lot better
+		than the other clocks. Anyway we are not exprected to send thousand of ping per seconds, so it's not a big issue on the resources usage.
+		https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps
+- Added a JSON output, which helps to use it on scripts rather than parsing the current output
+- Changed the default human reable output for it to look like more than the standard RedHat ping command which comes from iputils package.
+	It could be interesting to add a parameter to choose how the output would look like (windows, gnu ping, iputils ping, etc.)
+- Changed the status of the privileged flag to true by defaut when running on windows
+- Added a packet timeout value, which is more interesting than a whole command timeout
+	In order to do this, I store a time object in the awaitingSequences object instead of an empty struct.
+	As I've added also a packet timeout, we are supposed to have a not so big awaitingSequences object as it is cleaned at each packettimeout OnTimeout event
+- Improved the usage display on the cmd/ping command
+- Changed a bit the parameters from the command
+
+P.S. : this is the first time I do some GO coding, so please don't be mad at me for the code quality
